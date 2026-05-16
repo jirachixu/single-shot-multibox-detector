@@ -171,8 +171,8 @@ class SSDModel(nn.Module):
     def calculate_loss(self, 
             predicted_offsets: torch.Tensor, 
             predicted_class_scores: torch.Tensor, 
-            true_boxes: torch.Tensor, 
-            true_labels: torch.Tensor,
+            true_boxes: torch.Tensor | list[torch.Tensor], 
+            true_labels: torch.Tensor | list[torch.Tensor],
             neg_to_pos_ratio: int = 3
         ) -> torch.Tensor:
         '''

@@ -1,3 +1,6 @@
 __pycache__/
 img/
 .env
+cuda_check.py
+.venv/
+.vscode/
