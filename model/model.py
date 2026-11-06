@@ -75,7 +75,7 @@ class SSDModel(nn.Module):
         # https://docs.pytorch.org/docs/stable/generated/torch.nn.parameter.Buffer.html
         # basically, a tensor that is not a parameter, but should still be part of the model state
         # no gradients, etc.
-        self.register_buffer('anchor_boxes', None)
+        self.register_buffer('anchor_boxes', None, persistent=False)
         
     def _initialize_anchors(self, feature_maps: list[torch.Tensor]) -> None:
         '''
@@ -116,6 +116,7 @@ class SSDModel(nn.Module):
             nn.Conv2d(bottleneck_channels, bottleneck_channels, kernel_size=3, stride=stride, padding=padding),
             nn.ReLU(inplace=True),
             nn.Conv2d(bottleneck_channels, out_channels, kernel_size=1),
+            nn.ReLU(inplace=True),
         )
         
     def forward(self, img: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -237,6 +238,8 @@ class SSDModel(nn.Module):
                 n_negatives = min(neg_to_pos_ratio * n_pos_batch, conf_loss_bg.shape[0])
                 hard_negatives = idx[:n_negatives]
                 conf_loss_bg = conf_loss_bg[hard_negatives].sum()
+            else:
+                conf_loss_bg = torch.tensor(0.0, device=device)
             
             tot_conf_loss += conf_loss_pos + conf_loss_bg
             
