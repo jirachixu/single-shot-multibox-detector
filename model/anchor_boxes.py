@@ -26,8 +26,8 @@ def generate_anchor_boxes(
         **default_boxes**: tensor of shape (batch_size, num_boxes, 4) representing the default anchor boxes in
         (xmin, ymin, xmax, ymax) format, normalized between 0 and 1
     '''
-    # evenly spaced scales between 0.2 and 0.9, as described in the paper
-    scales = torch.linspace(0.2, 0.9, len(feature_maps), device=device)
+    # evenly spaced scales between 0.1 and 0.9, as described in the paper
+    scales = torch.linspace(0.1, 0.9, len(feature_maps), device=device)
     ratios = torch.tensor(aspect_ratios, device=device)
     boxes = []
     for k in range(len(feature_maps)):
@@ -106,7 +106,7 @@ def iou(boxes_a: torch.Tensor, boxes_b: torch.Tensor) -> torch.Tensor:
     intersection_areas = torch.clamp(x_right - x_left, min=0) * torch.clamp(y_bottom - y_top, min=0)
     # similar as before, pairwise matrix of union areas between each pair of boxes
     union_areas = areas_a[:, None] + areas_b - intersection_areas
-    iou = intersection_areas / union_areas
+    iou = intersection_areas / torch.clamp(union_areas, min=1e-8)
 
     return iou
 
@@ -133,8 +133,11 @@ def assign_bounding_boxes(
         ground truth box for each anchor box; -1 if no ground truth box is assigned
     '''
     n_anchors, n_ground_truths = anchor_boxes.shape[0], ground_truths.shape[0]
-    jaccards = iou(anchor_boxes, ground_truths)
     
+    if n_ground_truths == 0:
+        return anchor_bounding_boxes
+        
+    jaccards = iou(anchor_boxes, ground_truths)
     anchor_bounding_boxes = torch.full((n_anchors,), -1, dtype=torch.int64, device=device)
     
     # for each anchor box, get the ground truth box with the highest jaccard index, indices are column indices
@@ -237,7 +240,7 @@ def encode_offsets(
     offsets_h = dh / var_h
 
     encoded_offsets = torch.stack((offsets_cx, offsets_cy, offsets_w, offsets_h), dim=1)
-    encoded_boxes[mask, :] = encoded_offsets
+    encoded_boxes[mask, :] = encoded_offsets.to(encoded_boxes.dtype)
 
     return encoded_boxes
 
@@ -274,8 +277,8 @@ def decode_offsets(
     
     offsets_cx = encoded_offsets[:, 0] * var_cx
     offsets_cy = encoded_offsets[:, 1] * var_cy
-    offsets_w = encoded_offsets[:, 2] * var_w
-    offsets_h = encoded_offsets[:, 3] * var_h
+    offsets_w = torch.clamp(encoded_offsets[:, 2] * var_w, max=math.log(1000.0 / 16))
+    offsets_h = torch.clamp(encoded_offsets[:, 3] * var_h, max=math.log(1000.0 / 16))
     
     decoded_cx = offsets_cx * anchor_w + anchor_cx
     decoded_cy = offsets_cy * anchor_h + anchor_cy
