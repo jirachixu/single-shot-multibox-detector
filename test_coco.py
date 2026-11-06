@@ -1,7 +1,8 @@
 import argparse
 import os
+import time
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torchvision.datasets import CocoDetection
 import torchvision.transforms.functional as F_t
 from tqdm import tqdm
@@ -10,8 +11,14 @@ from model.model import SSDModel
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# Standard ImageNet normalization statistics required by pretrained ResNet50
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
+
+
 def collate_fn(batch):
     return tuple(zip(*batch))
+
 
 def get_coco_category_map(coco):
     """Creates a mapping from COCO category id to contiguous id (0-79)."""
@@ -20,6 +27,7 @@ def get_coco_category_map(coco):
     contiguous_to_coco_id = {i: coco_id for coco_id, i in coco_id_to_contiguous.items()}
     return coco_id_to_contiguous, contiguous_to_coco_id
 
+
 def main(args):
     try:
         from torchmetrics.detection.mean_ap import MeanAveragePrecision
@@ -27,6 +35,7 @@ def main(args):
         print("Error: torchmetrics is not installed. Please install it using 'pip install torchmetrics'.")
         return
 
+    print(f"Using device: {device}")
     print(f"Loading COCO dataset from {args.img_dir}...")
     try:
         # Note: torchvision.datasets.CocoDetection requires pycocotools to be installed
@@ -40,12 +49,42 @@ def main(args):
 
     coco_id_to_contiguous, _ = get_coco_category_map(dataset.coco)
 
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, collate_fn=collate_fn)
+    # Optionally filter out images without valid annotations (matches COCODatasetWrapper in train_coco.py)
+    if args.filter_empty:
+        valid_indices = []
+        coco_api = dataset.coco
+        for i, img_id in enumerate(dataset.ids):
+            ann_ids = coco_api.getAnnIds(imgIds=img_id, iscrowd=False)
+            anns = coco_api.loadAnns(ann_ids)
+            has_valid_box = any(
+                ann['bbox'][2] > 1.0 and ann['bbox'][3] > 1.0
+                for ann in anns
+            )
+            if has_valid_box:
+                valid_indices.append(i)
+        dataset = Subset(dataset, valid_indices)
+        print(f"Filtered dataset to {len(dataset)} images with valid annotations.")
+
+    # Optional: Slice dataset for quick sanity checks or matching training subset (e.g., --subset 310)
+    if args.subset is not None and args.subset > 0:
+        subset_size = min(args.subset, len(dataset))
+        dataset = Subset(dataset, range(subset_size))
+        print(f"Using a subset of {subset_size} images for evaluation.")
+
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=args.batch_size, 
+        shuffle=False, 
+        num_workers=args.workers, 
+        pin_memory=(device.type == "cuda"),
+        collate_fn=collate_fn
+    )
 
     print("Loading SSD Model...")
     model = SSDModel(n_classes=len(coco_id_to_contiguous))
     if args.weights and os.path.exists(args.weights):
-        model.load_state_dict(torch.load(args.weights, map_location=device))
+        # strict=False prevents errors if old checkpoints saved 'anchor_boxes' buffer
+        model.load_state_dict(torch.load(args.weights, map_location=device), strict=False)
         print(f"Loaded weights from {args.weights}")
     else:
         print("Warning: No weights provided or found. Evaluating with random weights.")
@@ -53,14 +92,21 @@ def main(args):
     model.to(device)
     model.eval()
 
+    use_amp = args.amp and (device.type == "cuda")
+    if use_amp:
+        print("Automatic Mixed Precision (AMP FP16) enabled for evaluation.")
+
     # If backend='pycocotools' is specified, it runs faster but requires pycocotools.
-    # Since torchvision's CocoDetection already requires pycocotools, we can safely try to use it.
     metric = MeanAveragePrecision(box_format='xyxy', iou_type='bbox', backend='pycocotools')
 
     print("Starting evaluation...")
-    with torch.no_grad():
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    eval_start_time = time.perf_counter()
+
+    with torch.inference_mode():
         for images, targets in tqdm(dataloader, desc="Evaluating"):
-            # Prepare images: SSD paper uses 300x300 inputs
+            # Prepare images: resize to 300x300 and apply ImageNet normalization matching training
             image_tensors = []
             original_sizes = []
             for img in images:
@@ -68,12 +114,18 @@ def main(args):
                 original_sizes.append((w, h))
                 img_t = F_t.to_tensor(img)
                 img_t = F_t.resize(img_t, [300, 300], antialias=True)
+                img_t = F_t.normalize(img_t, mean=IMAGENET_MEAN, std=IMAGENET_STD)
                 image_tensors.append(img_t)
             
-            image_tensors = torch.stack(image_tensors).to(device)
+            image_tensors = torch.stack(image_tensors).to(device, non_blocking=True)
             
-            # Predict
-            predictions = model.predict(image_tensors, iou_threshold=args.iou_threshold, confidence_threshold=args.conf_threshold)
+            # Predict with optional AMP
+            with torch.amp.autocast('cuda', enabled=use_amp):
+                predictions = model.predict(
+                    image_tensors, 
+                    iou_threshold=args.iou_threshold, 
+                    confidence_threshold=args.conf_threshold
+                )
             
             # Format predictions and targets for MeanAveragePrecision
             preds_for_metric = []
@@ -82,14 +134,13 @@ def main(args):
             for i, (pred, target, orig_size) in enumerate(zip(predictions, targets, original_sizes)):
                 orig_w, orig_h = orig_size
                 
-                # Model predictions are normalized [0, 1] xyxy
+                # Model predictions are normalized [0, 1] xyxy, scale back to original pixel coordinates
                 pred_boxes = pred['boxes'].clone()
                 pred_boxes[:, 0] *= orig_w
                 pred_boxes[:, 2] *= orig_w
                 pred_boxes[:, 1] *= orig_h
                 pred_boxes[:, 3] *= orig_h
                 
-                # The model outputs contiguous labels 0-79.
                 preds_for_metric.append({
                     'boxes': pred_boxes.cpu(),
                     'scores': pred['scores'].cpu(),
@@ -99,8 +150,13 @@ def main(args):
                 target_boxes = []
                 target_labels = []
                 for obj in target:
+                    # Skip crowd annotations if any
+                    if obj.get('iscrowd', 0) == 1:
+                        continue
                     # COCO bbox is [xmin, ymin, width, height]
                     x, y, w, h = obj['bbox']
+                    if w <= 1.0 or h <= 1.0:
+                        continue
                     target_boxes.append([x, y, x + w, y + h])
                     # Map COCO category id to contiguous (0-79)
                     contig_id = coco_id_to_contiguous.get(obj['category_id'], -1)
@@ -119,25 +175,56 @@ def main(args):
             
             metric.update(preds_for_metric, targets_for_metric)
 
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    eval_elapsed = time.perf_counter() - eval_start_time
+    total_images = len(dataset)
+    fps = total_images / eval_elapsed if eval_elapsed > 0 else 0
+    latency_ms = (eval_elapsed / total_images) * 1000 if total_images > 0 else 0
+
     print("Computing metrics (this may take a while)...")
     results = metric.compute()
     
     print("\n=== Evaluation Results ===")
+    primary_metrics = ['map', 'map_50', 'map_75', 'map_small', 'map_medium', 'map_large', 'mar_1', 'mar_10', 'mar_100']
+    for k in primary_metrics:
+        if k in results and isinstance(results[k], torch.Tensor) and results[k].numel() == 1:
+            print(f"{k:18}: {results[k].item():.4f}")
+
+    print("\n--- Additional Details ---")
     for k, v in results.items():
+        if k in primary_metrics:
+            continue
         if isinstance(v, torch.Tensor):
-            print(f"{k:15}: {v.item():.4f}")
+            if v.numel() == 1:
+                print(f"{k:18}: {v.item():.4f}")
+            elif k in ('map_per_class', 'mar_100_per_class'):
+                valid = v[v >= 0]  # torchmetrics sets unrepresented classes to -1
+                mean_str = f"{valid.mean().item():.4f}" if valid.numel() > 0 else "N/A"
+                print(f"{k:18}: mean = {mean_str} (across {valid.numel()} present classes)")
+            else:
+                print(f"{k:18}: {v.tolist()}")
         else:
-            print(f"{k:15}: {v}")
+            print(f"{k:18}: {v}")
+
+    print("\n=== Performance Benchmark ===")
+    print(f"Evaluated {total_images} images in {eval_elapsed:.2f}s")
+    print(f"Throughput : {fps:.2f} images/sec (FPS)")
+    print(f"Latency    : {latency_ms:.2f} ms per image")
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Test SSD Model on COCO Dataset")
     parser.add_argument('--img_dir', type=str, required=True, help='Path to COCO validation images directory (e.g., val2017)')
     parser.add_argument('--ann_file', type=str, required=True, help='Path to COCO validation annotations file (e.g., instances_val2017.json)')
-    parser.add_argument('--weights', type=str, default=None, help='Path to trained model weights (.pth)')
+    parser.add_argument('--weights', type=str, default='checkpoints/ssd_best.pth', help='Path to trained model weights (.pth)')
     parser.add_argument('--batch_size', type=int, default=8, help='Batch size for evaluation')
     parser.add_argument('--workers', type=int, default=4, help='Number of dataloader workers')
     parser.add_argument('--conf_threshold', type=float, default=0.01, help='Confidence threshold for NMS')
     parser.add_argument('--iou_threshold', type=float, default=0.45, help='IoU threshold for NMS')
+    parser.add_argument('--subset', type=int, default=None, help='Evaluate on only N images (e.g., --subset 310)')
+    parser.add_argument('--filter_empty', action='store_true', help='Filter out images without annotations (matches training subset)')
+    parser.add_argument('--amp', action='store_true', help='Enable Automatic Mixed Precision (FP16) on CUDA for faster evaluation')
     
     args = parser.parse_args()
     main(args)

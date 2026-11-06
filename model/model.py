@@ -2,7 +2,7 @@ import torch
 import torchvision.models as models
 import torch.nn as nn
 import torch.nn.functional as F
-from anchor_boxes import *
+from .anchor_boxes import *
 from torchvision.ops import batched_nms
 
 # debugging purposes

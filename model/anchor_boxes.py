@@ -133,12 +133,12 @@ def assign_bounding_boxes(
         ground truth box for each anchor box; -1 if no ground truth box is assigned
     '''
     n_anchors, n_ground_truths = anchor_boxes.shape[0], ground_truths.shape[0]
-    
-    if n_ground_truths == 0:
-        return anchor_bounding_boxes
         
     jaccards = iou(anchor_boxes, ground_truths)
     anchor_bounding_boxes = torch.full((n_anchors,), -1, dtype=torch.int64, device=device)
+    
+    if n_ground_truths == 0:
+        return anchor_bounding_boxes
     
     # for each anchor box, get the ground truth box with the highest jaccard index, indices are column indices
     # i.e. for each row get the value and index of the max value in that row

@@ -4,3 +4,5 @@ img/
 cuda_check.py
 .venv/
 .vscode/
+data/
+checkpoints/

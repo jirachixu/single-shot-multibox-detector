@@ -4,7 +4,13 @@ This is an SSD model implemented using Python/PyTorch from scratch, i.e. no mode
 
 ### Usage
 
-TODO: complete after full functionality is implemented
+Run the training script using `python3 train_coco.py` with any of the flags, and once training finishes, you can test with `python3 test_coco.py`.
+
+### Sample Prediction
+
+<div style="text-align:center">
+    <img src="sanity_check_prediction.jpg" width="500" alt="Sample prediction with predicted boxes and classes">
+</div>
 
 ### Visualize Anchor Boxes
 
